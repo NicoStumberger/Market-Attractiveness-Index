@@ -1,0 +1,872 @@
+---
+title: "Mercados Atractivos"
+author: "Nicolás Stumberger"
+date: '2020-01-22'
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5)
+```
+
+## Identificar mercados atractivos de exportación con Market Attractiveness Index
+
+Este reporte tiene como objetivo detallar la metodología Market Attractiveness Index (MAI) desarrollada por el International Trade Center (ITC) y replicada en R.
+
+### Introducción
+La metodología tiene como objetivo obtener de ranking de países de destino atractivos para la exportación de un producto específico desde un país de origen (en este caso particular, el país de origen es Argentina). Se utilizan 8 indicadores separados en 2 grupos: demanda y acceso. Los primeros 5 se ponderan resultando en un índice de **Demanda**, mientras que los últimos 3 se ponderan para obtener un índice de **Acceso**.
+
+El punto de partida para la construcción del índice es un producto. Todos los productos a nivel internacional se encuentran clasificados en un nomenclador y poseen una _posición arancelaria_ (código numérico) que los identifica en el _Sistema Armonizado_. Esta _posición arancelaria_ (PA) a 6 dígitos, llamada _HS 6_, es la que se utiliza para esta metodología.
+
+El ejemplo que se utiliza en este reporte toma la _posición arancelaria_ del vino fraccionado: **2204.21**.
+
+El estudio evalúa la demanda interancional de este producto y el grado de acceso a cada mercado respecto de los competidores. Para ello, utiliza determinadas variables a partir de las cuales infiere el nivel de **demanda** y de **acceso**.
+
+### Indice de Mercado Atractivo (MAI)
+Este índice está compuesto por 2 sub-índices: el **Indice de Demanda de Mercado** (IDM), que muestra la potencialidad de demande de un determindao producto en cada mercado de destino; y el **Indice de Acceso al Mercado** (IAM), que expresa la ventaja relativa que goza un producto del país de origen analizado (en este caso Argentina) en cada mercado de destino en función a la facilidad de acceder al mismo.
+
+## Código
+### Librerías utilizadas
+
+```{r librerias}
+library(tidyverse)
+library(readr)
+library(lubridate)
+library(pracma)
+library(readxl) 
+library(knitr) # para crear tablas html
+library(kableExtra) # también para crear tablas html más copadas
+```
+
+### Importación de datasets
+
+Existen 3 grupos de dataset necesarios para el cálculo del índice:
+
+* Actualización esporádica: aquellos que solo requieren actualizarse cuando haya algún cambio en el nombre de países o su código ISO.  
+* Actualización anual: aquellos que deben actualizarse, por lo menos, una vez por año.
+* Específicos (posición arancelaria invetigada): descargas específicas de la posición arancelaria investigada.  
+
+#### 1. Actualización esporádica
+Aquellos que solo requieren actualizarse cuando haya algún cambio en el nombre de países o su código ISO:
+
+* **Diccionario de países TradeMap - ISO: `trademap_iso`**  
+Confeccioné una tabla diccionario en excel previamente, para poder vincular los códigos ISO de países (ISO 3166-1 alfa-3) con los nombres de los países tal como aparecen en TradeMap (en español). Con este código, lo único que hago es importar esta tabla.
+```{r impo trademap_iso}
+# Diccionario código iso de país y nombre de país en español de TradeMap
+trademap_iso <- read_delim("input/trademap_iso.txt", 
+                           "\t", escape_double = FALSE, 
+                           locale = locale(encoding = "ISO-8859-1"), 
+                           trim_ws = TRUE) %>% 
+        as_tibble()
+```
+
+* **Tabla de código ISO (ONU): `pais_region`**  
+Utilizo este código para importar los códigos ISO del sitio te Naciones Unidas (<https://unstats.un.org/unsd/methodology/m49/>). La tabla importada viene con otras variables que pueden ser interesantes para analizar en conjunto con el resto de los datos, como continente y región.
+```{r iso_region}
+# Regiones, subregiones y nombre de paises (Naciones Unidas)
+pais_region <- read_csv("input/unsd_esp.csv")
+pais_region <- pais_region %>% select(reg = `Region Name`,
+                          subreg = `Sub-region Name`,
+                          reg_inter = `Intermediate Region Name`,
+                          pais = `Country or Area`,
+                          iso = `ISO-alpha3 Code`,
+                          des_en_des = `Developed / Developing Countries`)
+```
+
+* **Distancia geográfica entre países: `dist_cepii`**  
+Por últmo, importo la tabla de distancia bilateral disponible en el sitio de CEPII (<http://www.cepii.fr/CEPII/fr/bdd_modele/presentation.asp?id=6>).
+```{r cepii}
+# Dataset de distancia bilateral del CEPII
+dist_cepii <- read_delim("input/dist_cepii.txt", 
+                         "\t", escape_double = FALSE, 
+                         locale = locale(decimal_mark = ",",
+                                         grouping_mark = "."), 
+                         trim_ws = TRUE) %>% 
+        as_tibble()
+```
+
+#### 2. Actualización anual
+Aquellos que deben actualizarse, por lo menos, una vez por año:
+
+* **Proyecciones de crecimiento del PBI: `WEO_Data`**  
+Este dataset se descarga del sitio del FMI <https://www.imf.org/external/pubs/ft/weo/2019/02/weodata/download.aspx>.
+```{r proyecciones fmi}
+# Proyecciones de crecimiento gdp del FMI
+# el nombre del archivo debe modificarse por el que se descarga del sitio arriba mencionado.
+WEO_Data <- read_delim("input/WEOOct2019all.xls", 
+                       "\t", escape_double = FALSE, 
+                       col_types = cols(`2016` = col_double(),
+                                        `2017` = col_double(), `2018` = col_double(),
+                                        `2019` = col_double(), `2020` = col_double(), 
+                                        `2021` = col_double(), `2022` = col_double(),
+                                        `2023` = col_double(), `2024` = col_double()),
+                       locale = locale(), trim_ws = TRUE) %>% 
+        as_tibble()
+```
+
+* **Importaciones totales de Argentina: `arg_mt`**  
+Se descarga de TradeMap, previo registro y realizando una consulta de importaciones Argentina, todos los productos, series anuales, 5 años. El despliegue de la tabla debe mostrar los países socios.
+```{r impo arg tot}
+# Importaciones argentinas todos los productos, series anuales 5 anios
+arg_mt <- read_delim("input/arg_mt.txt", 
+                     "\t", escape_double = FALSE,
+                     col_names = FALSE,
+                     locale = locale(decimal_mark = ",",
+                                     grouping_mark = "."),
+                     trim_ws = TRUE, skip = 1) %>% 
+        as_tibble()
+```
+
+* **Exportaciones totales de Argentina: `arg_xt`**  
+Se descarga de TradeMap previo registro y realizando una consulta de exportaciones del país de origen (Argentina), todos los productos, series anuales, 5 años. El despliegue de la tabla debe mostrar los países socios.
+```{r expo arg tot}
+# Exportaciones argentinas todos los productos, series anuales 5 anios
+arg_xt <- read_delim("input/arg_xt.txt",
+                     "\t", escape_double = FALSE,
+                     col_names = FALSE,
+                     locale = locale(decimal_mark = ",",
+                                     grouping_mark = "."),
+                     trim_ws = TRUE,
+                     skip = 1) %>% 
+        as_tibble()
+```
+
+#### 3. Específicos (posición arancelaria invetigada)
+Aquellos que son descargas específicas de la posición arancelaria investigada:
+
+* **Exportaciones argentinas (indicadores): `xarg_ind`**  
+Se descarga de TradeMap. Exportaciones de Argentina, la posición arancelaria investigada, selección de indicadores.
+```{r exportaciones arg indic}
+# Exportaciones de Argentina al mundo Indicadores
+xarg_ind <- read_delim("input/xarg_ind.txt", 
+                       "\t", escape_double = FALSE,
+                       col_names = FALSE,
+                       locale = locale(decimal_mark = ",", grouping_mark = "."),
+                       trim_ws = TRUE, skip = 1) %>% 
+        as_tibble()
+```
+
+* **Importaciones mundiales (indicadores): `m_ind`**  
+Se descarga de TradeMap. Importaciones del mundo, posición arancelaria investigada, selección de indicadores.
+```{r importaciones mundiales indic}
+# Importaciones mundiales Indicadores
+m_ind <- read_delim("input/m_ind.txt", 
+                            "\t", escape_double = FALSE, col_names = FALSE,
+                            locale = locale(decimal_mark = ",", grouping_mark = "."), 
+                            trim_ws = TRUE, skip = 1) %>% 
+        as_tibble()
+
+# esto lo hago porque esa col me sigue manteniendo las comas sep decimal dps de importado. 
+# De esta forma lo convierto a num.
+m_ind <- m_ind %>% mutate(X13 = as.numeric(gsub(",", ".", X13)))
+```
+
+* **Importaciones mundiales en valores (5 periodos): `m`**  
+Se descarga de TradeMap. Importaciones de Argentina por país socio, posición arancelaria investigada, series anuales, 5 años, en valores (USD).
+```{r importaciones mundiales}
+# Importaciones mundiales 5 anios
+m <- read_delim("input/m.txt", "\t", escape_double = FALSE,
+                col_names = FALSE,
+                locale = locale(decimal_mark = ",", grouping_mark = "."), 
+                trim_ws = TRUE, skip = 1) %>% 
+        as_tibble()
+
+# m_mundo <- m %>% filter(X1 == "Mundo") %>% select(-X7) esta tabla puede servir para calcular la participación del país en las importaciones mundiales.
+```
+
+* **Exportaciones mundiales en valores (5 periodos): `x`**  
+Se descarga de TradeMap. Exportaciones de Argentina por país socio, posición arancelaria investigada, series anuales, 5 años, en valores (USD).
+```{r exportaciones mundiales}
+# Exportaciones mundiales 5 anios
+x <- read_delim("input/x.txt", "\t", escape_double = FALSE,
+                col_names = FALSE,
+                locale = locale(decimal_mark = ",", grouping_mark = "."),
+                trim_ws = TRUE, skip = 1) %>% 
+        as_tibble()
+```
+
+### Creación de diccionarios
+Creo tablas de diccionarios para las cabeceras (nombres de los campos) de los datasets específicos de la PA, ya que se importaron sin ellas porque se trataba de nombres muy largos y con caracteres especiales.
+
+Diccionario de la tabla de importaciones mundiales indicadores (`m_ind`):
+```{r}
+# Diccionario m_ind
+dic_m_ind <- read_delim("input/m_ind.txt", 
+                        "\t", escape_double = FALSE, col_names = TRUE,
+                        locale = locale(decimal_mark = ",", grouping_mark = "."), 
+                        trim_ws = TRUE, skip = 0) %>% 
+        as_tibble()
+
+# esto le saca las tildes a los nom de columnas, para evitar lecturas erróneas en dif sistemas op
+colnames(dic_m_ind) <- iconv(colnames(dic_m_ind), from = 'UTF-8', to = 'ASCII//TRANSLIT')
+
+dic_m_ind <- tibble(m_ind = colnames(m_ind), 
+                    dic = c(colnames(dic_m_ind))) %>% 
+        filter(m_ind != "X14")
+
+dic_m_ind <- dic_m_ind %>% 
+        mutate(dic = gsub("Seleccione sus indicadores-", "", dic))
+```
+
+Diccionario del dataset de exportaciones argentinas indicadores (`xarg_ind`):
+```{r}
+# Diccionario xarg_ind
+# Es el mismo proceso que en el dic anterior
+dic_xarg_ind <- read_delim("input/xarg_ind.txt", 
+                           "\t", escape_double = FALSE, col_names = TRUE,
+                           locale = locale(decimal_mark = ",", grouping_mark = "."), 
+                           trim_ws = TRUE, skip = 0) %>% 
+        as_tibble()
+
+colnames(dic_xarg_ind) <- iconv(colnames(dic_xarg_ind), from = 'UTF-8', to = 'ASCII//TRANSLIT')
+
+dic_xarg_ind <- tibble(xarg_ind = colnames(xarg_ind), 
+                       dic = c(colnames(dic_xarg_ind))) %>% 
+        filter(xarg_ind != "X17")
+
+dic_xarg_ind <- dic_xarg_ind %>% 
+        mutate(dic = gsub("Seleccione sus indicadores-", "", dic))
+```
+
+Diccionario de exportaciones anuales 5 años (`x`):
+```{r}
+# Diccionario x
+# Mismo proceso que el anterior
+dic_x <- read_delim("input/x.txt", 
+                    "\t", escape_double = FALSE, col_names = TRUE,
+                    locale = locale(decimal_mark = ",", grouping_mark = "."), 
+                    trim_ws = TRUE, skip = 0) %>% 
+        as_tibble()
+
+colnames(dic_x) <- iconv(colnames(dic_x), from = 'UTF-8', to = 'ASCII//TRANSLIT')
+
+dic_x <- tibble(x = colnames(x),
+                dic = c(colnames(dic_x))) %>% 
+        filter(x != "X7")
+```
+
+Diccionario de importaciones anuales 5 años (`m`):
+```{r}
+# Diccionario m
+# Mismo proceso
+dic_m <- read_delim("input/m.txt", 
+                    "\t", escape_double = FALSE, col_names = TRUE,
+                    locale = locale(decimal_mark = ",", grouping_mark = "."), 
+                    trim_ws = TRUE, skip = 0) %>% 
+        as_tibble()
+
+colnames(dic_m) <- iconv(colnames(dic_m), from = 'UTF-8', to = 'ASCII//TRANSLIT')
+
+dic_m <- tibble(m = colnames(m),
+                dic = c(colnames(dic_m))) %>% 
+        filter(m != "X7")
+```
+
+### Incorporación del código ISO de países
+
+A cada uno de los datasets específicos de la PA, les incorporo el código ISO de país para que funcione como vínculo con los otros datasets.
+
+```{r}
+# Hago un inner_join porque solo me quiero quedar con los paises con cod ISO & los que tengan datos en trademap
+m_ind <- inner_join(trademap_iso, m_ind, by = c("Importadores" = "X1"))
+
+x <- inner_join(trademap_iso, x, by = c("Importadores" = "X1"))
+
+m <- inner_join(trademap_iso, m, by = c("Importadores" = "X1"))
+
+xarg_ind <- inner_join(trademap_iso, xarg_ind, by = c("Importadores" = "X1"))
+```
+
+### Data wrangling
+
+Ordeno los dataset de importaciones `m` y exportaciones `x` de un formato _wide_ a un formato _long_. Aquí nombro los años de las columnas. Para futuras actualizaciones deberé cambiar el código con años actualizadas, o bien encontrar una manera de nombrar las columnas con nombres relativos (algo que aún no se me ocurre).
+
+```{r de wide a long}
+m_tidy <- m %>% mutate("2014" = X2,
+                       "2015" = X3,
+                       "2016" = X4,
+                       "2017" = X5,
+                       "2018" = X6) %>% 
+        select(iso,
+               "2014",
+               "2015",
+               "2016",
+               "2017", 
+               "2018") %>% 
+        drop_na() %>%
+        gather("2014", "2015", "2016", "2017", "2018", 
+               key = anio, 
+               value = "USD") %>% 
+        # filter(Importadores != "Mundo") %>%
+        filter(USD != 0)
+
+x_tidy <- x %>%  mutate("2014" = X2,
+                        "2015" = X3,
+                        "2016" = X4,
+                        "2017" = X5,
+                        "2018" = X6) %>% 
+        select(iso,
+               "2014",
+               "2015",
+               "2016",
+               "2017",
+               "2018") %>% 
+        drop_na() %>% 
+        gather("2014", "2015", "2016", "2017", "2018",
+               key = anio,
+               value = "USD") %>% 
+        # filter(Importadores != "Mundo") %>% 
+        filter(USD != 0) 
+```
+
+### Filtro de países
+
+Según la metodología, debo realizar los cálculos de índices solo sobre aquellos países que registren importaciones durante los 5 años del análisis. Para ello, creo una tabla que me sirva para filtrar.
+```{r filtro}
+m_filter <- m_tidy %>% group_by(iso) %>% 
+        count() %>% 
+        filter(n == 5) %>% 
+        as_tibble()
+```
+
+Luego, aplico el filtro en los datasets `m_tidy` y `x_tidy`:
+```{r}
+# Para quedarme solo con los paises de m_filter en el dataset de m_tidy
+m_tidy <- left_join(m_filter, m_tidy, "iso") %>% 
+        arrange(anio, desc(USD)) %>% 
+        select(-n) %>% # esto lo puso para NO seleccionar la columna "n" que dice 5 (anios)
+        as_tibble()
+
+x_tidy <- left_join(m_filter, x_tidy, "iso") %>% 
+        arrange(anio, desc(USD)) %>% 
+        select(-n) %>% 
+        as_tibble() %>% 
+        drop_na()
+```
+
+### Índice de Tamaño de Mercado
+
+Según la metodología, para calcular el índice de tamaño del mercado `itm` debo, primero, obtener el promedio de importaciones durante los 5 periodos analizados. Luego, calcular el logaritmo de este promedio y, por último, convertirlo a índices.
+```{r}
+itm <- m_tidy %>% 
+        group_by(iso) %>% 
+        summarise(media_log = log(mean(USD))) %>% # log del promedio de los 5 periodos por país
+        mutate(itm = (media_log - min(media_log)) /
+                       (max(media_log) - min(media_log)) * 100) # cálculo del índice
+```
+
+### Índice de Crecimiento de Mercado
+
+Primero, debo calcular la tasa de crecimiento medio:
+```{r tasa de crec de mercado}
+# aca agrupo por importadores porque quiero que calcule cada pais x sep
+tcm <- m_tidy %>% group_by(iso) %>% 
+        # ordeno por año para luego poder calcular la variación
+        arrange(anio) %>% 
+        # aca utilizo la fc lag, que me toma el valor de x veces anterior
+        mutate(tcm = (USD - lag(USD, 4)) / 
+                       (USD + lag(USD, 4)) * # 
+                       100) %>% 
+        # solo me quedo con el último año, porque es el unico que tiene una variacion calculada
+        filter(anio == max(anio, na.rm = TRUE)) %>%
+        # esto es importante, xq si no me lo guarda como grouped_df y cdo quiero aplicar el
+        ## min() me lo aplica mal (min de ese grupo, en este caso min de ese pais)
+        as_tibble()
+```
+
+Luego, con el resultado anterior, calculo el índice:
+```{r indice de crec mercado}
+icm <- tcm %>% mutate(icm = (tcm - min(tcm)) /
+                       (max(tcm) - min(tcm)) *
+                       100)
+```
+
+### Índice de Balanza Comercial
+
+La balanza comercial, en este caso, es la suma de las exportaciones de cada país (es decir la suma de los 5 periodos analizados) menos la suma de importaciones para los 5 periodos. Además, debe calcularse el comercio total, que se logra sumando ambos flujos (importaciones durante los 5 periodos más las exportaciones durante los 5 periodos). Por último, el ratio balanza comercial / comercio total, se calcula dividiendo el primero por el segundo y multiplicando por 100.
+
+Finalmente, el índice es calculado utilizando la misma metodología que en los índices anteriores con una diferencia: se debe otorgar un mayor valor (en índice) a las observaciones que registren un ratio de balanza comercial sobre comercio total bajo (porque queremos destacar mercados que consumen más de lo que exportan). Por este motivo, en el cálculo del índice, las variabes se invierten.
+```{r}
+m_sum <- m_tidy %>% group_by(iso) %>% 
+        summarise(sum_m5 = sum(USD, na.rm = TRUE))
+
+x_sum <- x_tidy %>% group_by(iso) %>% 
+        summarise(sum_x5 = sum(USD, na.rm = TRUE))
+
+bc <- full_join(m_sum, x_sum, by = "iso")
+#reemplazo los NA por 0 porque si es NA quiere decir que el valor exportado o impo es 0
+bc[is.na(bc)] <- 0 
+
+
+ibc <- bc %>% mutate(bc = sum_x5 - sum_m5,
+                     ct = sum_x5 + sum_m5,
+                     bc_ratio = (bc / ct) * 100,
+                     ibc = (bc_ratio - max(bc_ratio)) / # es inverso al anterior
+                             (min(bc_ratio) - max(bc_ratio)) *
+                             100)
+```
+
+### Índice de Variación de la Balanza Comercial
+
+Para calcular la variación de la balanza comercial, debemos conocer la balanza comercial en el último año `pf` al igual que en el primero `pi`.
+
+Balanza Comercial del periodo final `pf`:
+```{r}
+m_pf <- m_tidy %>% filter(anio == "2018") # encontrar la forma de filtrar el ult anio sin decir "2018".
+x_pf <- x_tidy %>% filter(anio == "2018")
+
+bc_pf <- full_join(m_pf, x_pf, by = "iso") %>% 
+        mutate(m_USD = USD.x,
+               x_USD = USD.y) %>% 
+        select(iso,
+               m_USD,
+               x_USD)
+bc_pf[is.na(bc_pf)] <- 0 # los valores NA los convierto a 0        
+
+bc_pf <- bc_pf %>% mutate(bc_pf = (x_USD - m_USD) /
+                         (x_USD + m_USD))
+```
+
+Balanza Comercial del periodo inicial `pi`:
+```{r}
+m_pi <- m_tidy %>% 
+        filter(anio == min(anio, na.rm = TRUE))
+
+x_pi <- x_tidy %>% 
+        filter(anio == min(anio, na.rm = TRUE))
+
+bc_pi <- full_join(m_pi, x_pi, by = "iso") %>% 
+        mutate(m_USD = USD.x,
+               x_USD = USD.y) %>% 
+        select(iso,
+               m_USD,
+               x_USD)
+
+bc_pi[is.na(bc_pi)] <- 0 
+
+bc_pi <- bc_pi %>% mutate(bc_pi = (x_USD - m_USD) /
+                         (x_USD + m_USD))
+```
+
+Unir ambos periodos para la creación del índice `ìvbc`:
+```{r}
+ivbc <- full_join(bc_pi, bc_pf, "iso")
+
+ivbc[is.na(ivbc)] <- 0
+
+ivbc <- ivbc %>%
+        mutate(v_bc = bc_pf - bc_pi) %>% # variación absoluta entre ambos periodos
+        select(iso,
+               v_bc) %>% 
+        # calculo el índice, nuevamente de manera inversa
+        mutate(ivbc = (v_bc - max(v_bc)) /
+                       (min(v_bc) - max(v_bc)) *
+                       100)
+```
+
+### Índice de Perspectivas del Mercado
+
+Para el índice de pespectivas, utilizo la tabla del WEO con las proyecciones para los próximos años de todos los países. 
+```{r}
+# selecciono las variables que me interesan del dataset
+fmi <- WEO_Data[, c(2, 3, ncol(WEO_Data) - 6, ncol(WEO_Data) - 1)] %>% 
+        # calculo la tasa de crecimiento anual para los periodos futuros disponibles
+        mutate(v_gdp = (nthroot(`2024` / `2019`, 5) - 1) * 100) %>% 
+        drop_na() %>% 
+        # Aquí filtro la variable con el código PPPGDP que hace referencia al PBI paridad del poder adquisitivo
+        filter(`WEO Subject Code` == "PPPGDP")
+
+# calculo la tasa de crecimiento anual promedio de todas las economías
+fmi_prom <- fmi %>% summarise(mean(v_gdp)) %>% as.numeric() # as.num porque sino me crea un df
+
+
+ipm <- left_join(m_filter, fmi, by = c("iso" = "ISO")) %>% 
+        select(iso, v_gdp)
+
+ipm$v_gdp[is.na(ipm$v_gdp)] <- fmi_prom # relleno las observaciones NA con el promedio
+
+ipm$v_gdp <- round(ipm$v_gdp, 2) # y aca no podria redondear si fuera una list heterogenea
+
+# calculo del índice
+ipm <- ipm %>% 
+        mutate(ipm = (v_gdp - min(v_gdp)) /
+                       (max(v_gdp) - min(v_gdp)) *
+                       100)
+```
+
+### Índice de Ventaja Arancelaria
+
+La ventaja arancelaria se calcula como la diferencia entre el arancel promedio que pagan los proveedores en el mercado de destino `eav` y el promedio que paga Argentina en el mercado de destino `arancel_arg`.
+```{r ventaja arancelaria}
+# Limpio y ordeno una tabla con aranceles equivalentes ad valorem (eav)
+ara_mundo <- m_ind[, c("iso", "X13")] %>%
+        mutate(eav = X13) %>%
+        select(iso,
+               eav) %>%
+        drop_na() %>% 
+        filter(eav != "...")
+
+# Limpio y ordeno una tabla con los aranceles promedio que percibe Arg en cada país
+ara_arg <- xarg_ind %>% 
+        select(iso,
+               X16) %>% 
+        mutate(arancel_arg = X16) %>%
+        select(iso,
+               arancel_arg) %>% 
+        drop_na() %>% 
+        filter(arancel_arg != "...")
+
+# Calculo la ventaja arancelaria
+iva <- left_join(ara_mundo, ara_arg, by = "iso") %>% 
+        mutate(va = eav - arancel_arg) 
+
+# Hasta aca calcule la vtaja nomas, pero el indice se calcula sobre todos los otros paises previamente filtrados. Porque para los q no haya datos, va el promedio.
+
+# Esto es porque quiero hacer el indice sobre los mercados filtrados m_filter
+iva <- left_join(m_filter, iva, by = "iso") 
+
+# Calculo la ventaja arancelaria promedio va_prom
+va_prom <- iva %>% 
+        drop_na() %>% # quitar los NA porque sino el resultado me da NA.
+        summarise(mean(va)) %>% 
+        as.numeric()
+
+# Ahora si, relleno los NA de la tabla iva con la ventaja arancelaria promedio
+iva$va[is.na(iva$va)] <- va_prom
+
+iva$va <- round(iva$va, 2) # esto no sé si es necesario ahora
+
+# Calculo el índice
+iva <- iva %>% 
+        mutate(iva = (va - min(va)) /
+                       (max(va) - min(va)) *
+                       100) %>% 
+        select(-n)
+```
+
+### Índice de la Ventaja Geográfica
+
+Para este índice utilizo la tabla de importaciones totales (indicadores) `m_ind`, que contiene una variable de distancia media medida en km. La uno con la distancia de Argentina a todos los países, para calcular la diferencia entre ambas que luego me lleva a la obtención del índice.
+```{r ventaja geo}
+# Obtengo la distancia media
+dist_media <- m_ind %>% 
+        mutate(dist_media = X11) %>% 
+        select(iso,
+               dist_media)
+
+# Limpio y ordeno la tabla para obtener la distancia de Arg a los destinos
+dist_arg <- dist_cepii %>% 
+        filter(iso_o == "ARG") %>% 
+        mutate(dist_arg = dist) %>% 
+        select(iso_d,
+               dist_arg)
+
+# Uno ambas tablas y calculo la diferencia (vtja_geo)
+v_geo <- left_join(dist_media, dist_arg, by = c("iso" = "iso_d")) %>% 
+        mutate(vtja_geo = dist_media - dist_arg)
+
+# Uno la tabla anterior al filtro de países
+v_geo <- left_join(m_filter, v_geo, by = "iso")
+
+# Calculo la ventaja geografica promedio para luego rellenar los NA
+v_geo_prom <- v_geo %>% 
+        drop_na() %>% 
+        summarise(mean(vtja_geo)) %>% 
+        as.numeric()
+
+# Relleno NA con el promedio
+v_geo$vtja_geo[is.na(v_geo$vtja_geo)] <- v_geo_prom
+
+v_geo$vtja_geo <- round(v_geo$vtja_geo, 2)
+
+# Calculo el índice
+ivg <- v_geo %>% 
+        mutate(ivg = (vtja_geo - min(vtja_geo)) /
+                       (max(vtja_geo) - min(vtja_geo)) *
+                       100) %>% 
+        select(-n)
+```
+
+### Índice de Relaciones Comerciales
+
+Las relaciones comerciales es un indicador que se calcula sumando el comercio total (todos los productos) de Argentina con cada uno de los países: importaciones + exportaciones
+```{r relaciones comerciales}
+# Primero convierto la tabla arg_mt de un formato wide a long
+arg_mt_tidy <-  arg_mt %>% mutate("2014" = X2,
+                  "2015" = X3,
+                  "2016" = X4,
+                  "2017" = X5,
+                  "2018" = X6) %>% 
+        gather("2014", "2015", "2016", "2017", "2018", 
+               key = anio,
+               value = "import") %>% 
+        select(X1,
+               anio,
+               import) %>% 
+        group_by(X1) %>% 
+        summarise(sum_mt = sum(import))
+
+# Convierto la tabla arg_xt de wide a long
+arg_xt_tidy <-  arg_xt %>% mutate("2014" = X2,
+                  "2015" = X3,
+                  "2016" = X4,
+                  "2017" = X5,
+                  "2018" = X6) %>% 
+        gather("2014", "2015", "2016", "2017", "2018", 
+               key = anio,
+               value = "export") %>% 
+        select(X1,
+               anio,
+               export) %>% 
+        group_by(X1) %>% summarise(sum_xt = sum(export))
+
+# Uno las dos tablas
+rel_com <- full_join(arg_mt_tidy, arg_xt_tidy, by = "X1") # junto impo y expo
+
+# Las junto con los codigo iso
+rel_com <- left_join(trademap_iso, rel_com, by = c("Importadores" = "X1")) 
+
+# Filtro para quedarme solo con los países seleccionados
+rel_com <- left_join(m_filter, rel_com, by = "iso")
+
+# Cambio los NA por 0 para las relaciones comerciales
+rel_com$sum_mt[is.na(rel_com$sum_mt)] <- 0 
+rel_com$sum_xt[is.na(rel_com$sum_xt)] <- 0
+
+# Sumo las importaciones totales con las exportaciones totales para calcular las relaciones
+rel_com <- rel_com %>% 
+        mutate(rel_com = sum_mt + sum_xt) %>% 
+        select(iso,
+               sum_mt,
+               sum_xt,
+               rel_com)
+
+# Calculo el log y luego el índice
+irc <- rel_com %>% 
+        mutate(log_rc = if_else(log(rel_com) == -Inf,
+                                0, 
+                                log(rel_com)),
+               irc = (log_rc - min(log_rc)) /
+                      (max(log_rc) - min(log_rc)) *
+                      100)
+```
+
+### Limpieza de ambiente
+
+Puedo hacer un poco de limpieza de ambiente para deshacerme de los objetos creados que no voy a utilizar más. Para ello, utilizo la función `rm()` y `gc()`. Objetos obsoletos: `bc`, `bc_pi`, `bc_pf`, `m_sum`, `m_pi`, `m_pf`, `tcm`, `x_sum`, `x_pi`, `x_pf`, `arg_mt`, `arg_mt_tidy`, `arg_xt`, `arg_xt_tidy`, `dist_cepii`, `fmi`, `m_tidy`, `rel_com`, `v_geo`, `WEO_Data`, `x_tidy`, `fmi_prom`, `v_geo_prom`, `va_prom`, `dic_m`, `dic_x`.
+
+```{r limpieza de ambiente, include = FALSE}
+rm(bc,
+   bc_pi,
+   bc_pf,
+   m_sum,
+   m_pi,
+   m_pf,
+   tcm,
+   x_sum,
+   x_pi,
+   x_pf,
+   arg_mt,
+   arg_mt_tidy,
+   arg_xt,
+   arg_xt_tidy,
+   dist_cepii,
+   fmi,
+   m_tidy,
+   rel_com,
+   v_geo,
+   WEO_Data,
+   x_tidy,
+   fmi_prom,
+   v_geo_prom,
+   va_prom,
+   dic_m,
+   dic_x)
+gc()
+```
+
+### Índice de Demanda de Mercado (IDM)
+Éste índice pondera los 5 índices de demanda previamente calculados, que son:  
+
+* Tamaño de mercado `itm`
+* Crecimento de mercado `icm`
+* Balanza comercial `ibc`
+* Variación de la balanza comercial `ivbc`
+* Perspectivas del mercado `ipm`
+
+Puedo darle el peso que quiera a cada uno de estos índices sobre el IDM.
+```{r indice crec mercado}
+
+# Creo unos ponderadores (totalemnte arbitrarios) para darle más peso a los indicadores que creo más importantes y menos a los de menor importancia. Esto sirve para que no pesen tanto mercados muy pequeños que registran altísimas tasas de crecimiento.
+pond_itm <- 40 # el tamaño del mercado (cuánto importa del producto) es lo más importante
+pond_icm <- 30
+pond_ibc <- 10
+pond_ivbc <- 10
+pond_ipm <- 10
+
+# Uno todas las tablas y calculo el índice utilizando los ponderadores
+IDM <- left_join(itm, icm) %>% 
+        left_join(ibc) %>% 
+        left_join(ivbc) %>%
+        left_join(ipm) %>% 
+        select(iso,
+               itm,
+               icm,
+               ibc,
+               ivbc,
+               ipm) %>% 
+        mutate(IDM = ((itm * pond_itm) + 
+                              (icm * pond_icm) + 
+                              (ibc * pond_ibc) + 
+                              (ivbc * pond_ivbc) + 
+                              (ipm * pond_ipm)) /
+                       sum(pond_itm, pond_icm, pond_ibc, pond_ivbc, pond_ipm)
+               ) %>% 
+        arrange(desc(IDM))
+```
+
+### Índice de Acceso de Mercado (IAM)
+
+Este índice pondera los 3 indices de acceso previamente calculados, que son:  
+
+* Ventaja arancelaria `iva`
+* Ventaja geográfica `ivg`
+* Relaciones comerciales `irc`
+
+```{r indice de acceso mercado}
+
+# Creo ponderadores. Por defecto, le estoy dando el mismo peso a cada uno de los indicadores de acceso
+pond_iva <- 1
+pond_ivg <- 1
+pond_irc <- 1
+
+
+IAM <- left_join(iva, ivg) %>%
+        left_join(irc) %>% 
+        select(iso,
+               iva,
+               ivg,
+               irc) %>% 
+        mutate(IAM = ((iva * pond_iva) + (ivg * pond_ivg) + (irc * pond_irc)) /
+                       sum(pond_iva, pond_ivg, pond_irc)) %>% 
+        arrange(desc(IAM))
+```
+
+### Índice Mercado Atractivo (MAI)
+Por último, calculo el índice de atractivo utilizando el índice de demanda `IDM` y el índice de acceso `IAM`.
+
+Nuevamente, utilizo ponderadores para otorgarle mayor peso a la demanda que al acceso. Sin embargo, esto puede modificarse.
+```{r indice atractivo}
+pond_IDM <- 65
+pond_IAM <- 35
+
+MAI <- left_join(IDM, IAM) %>% 
+        mutate(MAI = ((IDM * pond_IDM) + (IAM * pond_IAM)) /
+                       sum(pond_IDM, pond_IAM)) %>% 
+        arrange(desc(MAI))
+```
+
+Incorporo al dataset los nombres de los países y ordeno las columnas:
+```{r}
+MAI <- MAI %>% 
+        left_join(pais_region, by = "iso") %>% 
+        select(pais,
+               iso,
+               itm,
+               icm,
+               ibc,
+               ivbc,
+               ipm,
+               IDM,
+               iva,
+               ivg,
+               irc,
+               IAM,
+               MAI)
+```
+
+## Resultados
+Para finalizar, puedo ver los respultados obtenidos utilizando diferentes visualizaciones
+ 
+Tabla del top10 de mercados atractivos según el índice:
+```{r tabla_top10}
+
+knitr::kable(subset(head(MAI, 10)), 
+             digits = 2,
+             format.args = list(decimal.mark = ",")) %>% 
+        kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+
+Top 10 de mercados atractivos
+```{r grafico lollipop}
+
+g1 <- ggplot(subset(head(MAI, 10)), mapping = aes(reorder(pais, MAI), MAI))
+
+# Yeeeeeaaah incporporé geom_segment, queda muy bien. !! Ahora a sumar punto sup e inf (IDM y IAM)
+# min(MAI) para que sea relativo a la data y no un ylim constante. max() - min()*5/100 es para extender el eje hacia la izquierda un 5% del total del rango.
+g1 + geom_segment(aes(x = reorder(pais, MAI), xend = pais, y = min(MAI) - ((max(MAI) - min(MAI)) * 5 / 100) , yend = MAI), color = "grey", size = 0.8) +
+        geom_point(color = "green3", size = 3) +
+        coord_flip() +
+        labs(title = "Principales mercados atractivos según MAI",
+             caption = "Fuente: datos de ITC (en base a Comtrade), FMI, CEPII.",
+             x = "",
+             y = "MAI")
+
+
+```
+
+Top 10 atractivos con el segmento IDM - IAM
+```{r grafico lollipop de segmento}
+# Benchmark
+# <https://www.r-graph-gallery.com/303-lollipop-plot-with-2-values.html> 
+
+# primero pongo el segmento con las variables de cada extremo
+g1 + geom_segment(aes(reorder(pais, MAI), xend = pais, y = IDM, yend = IAM), color = "grey") +
+        # sumo uno de los extremos, pero como en g1 la variable "x" esta reordenada, debo respetar esa sintaxis
+        geom_point(mapping = aes(reorder(pais, MAI), IAM, color = "Acceso"), size = 2) +
+        geom_point(mapping = aes(reorder(pais, MAI), IDM, color = "Demanda"), size = 2) +
+        geom_point(mapping = aes(color = "Atractivo\n(Demanda & Acceso)"), size = 2.5) +
+        # para el otro extremo también debo respetar la sintaxis (reorder(pais, MAI))
+        coord_flip() +
+        labs(title = "Principales mercados atractivos según MAI",
+             subtitle = "¿Qué variable lo hace más atractivo? ",
+             caption = "Fuente: datos de ITC (en base a Comtrade), FMI, CEPII.",
+             x = "",
+             y = "MAI",
+             color = "Indices") +
+        theme(legend.position = "top")
+
+```
+
+
+Gráfico de dispersión con la relación IAM-IDM
+```{r}
+top10 <- head(MAI, 10)
+```
+
+```{r scatterplot MAI, fig.width = 10, fig.height = 6}
+ggplot(MAI, mapping = aes(IAM, IDM)) +
+        geom_point(mapping = aes(color = MAI)) +
+        geom_point(size = 3, shape = 1, data = top10) + # incorporo el top10 para resaltarlos
+        ggrepel::geom_label_repel(aes(label = pais), data = top10, alpha = 0.5) +
+        labs(title = "Acceso y Demanda",
+             subtitle = "¿Cuánto mide cada país?",
+             caption = "Fuente: datos de ITC (en base a Comtrade), FMI, CEPII.",
+             x = "Acceso (IAM)",
+             y = "Demanda (IDM)",
+             color = "Atractivo (MAI)")
+```
+
+Exporto el dataset como csv
+```{r creación csv con resultados}
+# El nombre del path cambia en función a la posición arancelaria investigada.
+# !! todavía tengo que solucionar los caracteres especiales con los que se guarda el csv. Cuando lo habro en excel me aparecen signos extraños en lugar de letras con tildes.
+write_csv2(MAI, "output_test_files/mai_220421.csv") 
+```
+
+## Extención
+Utilizando la data previamente importada para el desarrollo de este índice, puede confeccionarse un dataset ampliado con más variables interesantes para evaluar los mercados y continuar haciendo EDA (Exporatory Data Analysis). Tal es el caso de, por ejemplo: distancia hacia destinos, aranceles promedio, tasas de crecimiento, participación de mercado, regiones, entre otros.
+
+
+
